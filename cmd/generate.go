@@ -12,9 +12,10 @@ var generateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		specPath, _ := cmd.Flags().GetString("spec")
 		outputDir, _ := cmd.Flags().GetString("out")
+		moduleName, _ := cmd.Flags().GetString("module")
 
 		gen := generator.NewGenerator()
-		return gen.Generate(specPath, outputDir)
+		return gen.Generate(specPath, outputDir, moduleName)
 	},
 }
 
@@ -24,4 +25,5 @@ func init() {
 	generateCmd.Flags().StringP("spec", "s", "", "Path to the OpenAPI specification file (required)")
 	generateCmd.MarkFlagRequired("spec")
 	generateCmd.Flags().StringP("out", "o", "./cli-out", "Output directory for the generated code")
+	generateCmd.Flags().StringP("module", "m", "", "Module name for the generated code")
 }
