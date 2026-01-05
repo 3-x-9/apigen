@@ -125,7 +125,6 @@ func writeConfig(outputDir string) error {
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -200,55 +199,186 @@ func sanitizeCommandName(path, method string) string {
 }
 
 func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *openapi3.Operation, path, method string) error {
-	cmdCode := fmt.Sprintf(`
-	package cmd
+	// Build parameter-driven code pieces from the operation parameters
+	var imports = map[string]bool{
+		"fmt":                                true,
+		"github.com/spf13/cobra":             true,
+		fmt.Sprintf("%s/config", moduleName): true,
+		"net/http":                           true,
+		"io/ioutil":                          true,
+		"encoding/json":                      true,
+		"net/url":                            true,
+		"strings":                            true,
+	}
 
-	import (
-		"fmt"
-		"github.com/spf13/cobra"
-		"%s/config"
-		"net/http"
-		"io/ioutil"
-		"encoding/json"
-	)
-	func New%sCmd() *cobra.Command {
-		var limit int
-		
-		cmd := &cobra.Command{
-			Use:   "%s",
-			Short: "%s",
-			RunE: func(cmd *cobra.Command, args []string) error {
-				cfg := config.Load("%s")
-				url := fmt.Sprintf("%%s%s?limit=%%d", cfg.BaseURL, limit)
-				resp, err := http.Get(url)
-				if err != nil {
-					return err
-				}
-				defer resp.Body.Close()
-				body, err := ioutil.ReadAll(resp.Body)
-				if err != nil {
-					return err
-				}
-				var pretty map[string]interface{}
-				if err := json.Unmarshal(body, &pretty); err != nil {
-					return err
-				}
-				prettyJSON, err := json.MarshalIndent(pretty, "", "  ")
-				if err != nil {
-					return err
-				}
-				fmt.Println(string(prettyJSON))
-				return nil
-			},	
+	var varDecls strings.Builder
+	var flagsSetup strings.Builder
+	var pathReplacements strings.Builder
+	var queryBuild strings.Builder
+	var needStrconv bool
+
+	// default common param used in many generated commands
+	varDecls.WriteString("\tvar limit int\n\n")
+	flagsSetup.WriteString("\tcmd.Flags().IntVar(&limit, \"limit\", 10, \"Maximum number of items\")\n")
+
+	for _, pRef := range op.Parameters {
+		if pRef == nil || pRef.Value == nil {
+			continue
 		}
-		cmd.Flags().IntVar(&limit, "limit", 10, "Maximum number of items")
-		return cmd
-	
-		}	
-`, moduleName, cmdName, cmdName, op.Summary, moduleName, path)
+		p := pRef.Value
+		name := p.Name
+		in := p.In
+
+		// determine type (default to string)
+		goType := "string"
+		flagFunc := "StringVar"
+		// varName used in generated code
+		varName := sanitizeVar(name)
+
+		if p.Schema != nil && p.Schema.Value != nil {
+			types := p.Schema.Value.Type
+			if len(*types) > 0 {
+				switch (*types)[0] {
+				case "string":
+					goType = "string"
+					flagFunc = "StringVar"
+				case "integer":
+					goType = "int"
+					flagFunc = "IntVar"
+					imports["strconv"] = true
+				case "boolean":
+					goType = "bool"
+					flagFunc = "BoolVar"
+					imports["strconv"] = true
+				default:
+					// treat other types as string for MVP
+					goType = "string"
+					flagFunc = "StringVar"
+				}
+			}
+		}
+
+		varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
+
+		// flag registration
+		defaultVal := "\"\""
+		if goType == "int" {
+			defaultVal = "0"
+		} else if goType == "bool" {
+			defaultVal = "false"
+		}
+		flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
+
+		// code to handle where the param goes
+		if in == "path" {
+			// replace path placeholders with param values
+			replacement := varName
+			if goType == "int" {
+				replacement = fmt.Sprintf("strconv.Itoa(%s)", varName)
+				needStrconv = true
+			} else if goType == "bool" {
+				replacement = fmt.Sprintf("strconv.FormatBool(%s)", varName)
+				needStrconv = true
+			}
+			pathReplacements.WriteString(fmt.Sprintf("\tpathWithParams = strings.ReplaceAll(pathWithParams, \"{%s}\", %s)\n", name, replacement))
+		} else if in == "query" {
+			if goType == "string" {
+				queryBuild.WriteString(fmt.Sprintf("\tif %s != \"\" { q.Set(\"%s\", %s) }\n", varName, name, varName))
+			} else if goType == "int" {
+				replacement := fmt.Sprintf("strconv.Itoa(%s)", varName)
+				queryBuild.WriteString(fmt.Sprintf("\tif %s != 0 { q.Set(\"%s\", %s) }\n", varName, name, replacement))
+				needStrconv = true
+			} else if goType == "bool" {
+				replacement := fmt.Sprintf("strconv.FormatBool(%s)", varName)
+				queryBuild.WriteString(fmt.Sprintf("\tq.Set(\"%s\", %s)\n", name, replacement))
+				needStrconv = true
+			}
+		} else if in == "header" {
+			queryBuild.WriteString(fmt.Sprintf("\t// header param %s available in %s variable\n", name, varName))
+		}
+	}
+
+	// build import block
+	var importLines strings.Builder
+	for imp := range imports {
+		if imp == "strconv" && !needStrconv {
+			continue
+		}
+		importLines.WriteString(fmt.Sprintf("\t\"%s\"\n", imp))
+	}
+
+	// construct the final command source code
+	cmdCode := fmt.Sprintf(`package cmd
+
+import (
+%s
+)
+func New%sCmd() *cobra.Command {
+%s
+	cmd := &cobra.Command{
+		Use:   "%s",
+		Short: "%s",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.Load("%s")
+			pathWithParams := "%s"
+%s
+			// build URL and query params
+			u := url.URL{Path: pathWithParams}
+			q := url.Values{}
+%s
+			u.RawQuery = q.Encode()
+			fullUrl := strings.TrimRight(cfg.BaseURL, "/") + u.String()
+			resp, err := http.Get(fullUrl)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
+			var pretty interface{}
+			if err := json.Unmarshal(body, &pretty); err != nil {
+				return err
+			}
+			prettyJSON, err := json.MarshalIndent(pretty, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(prettyJSON))
+			return nil
+		},
+	}
+%s
+	return cmd
+}
+`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), flagsSetup.String())
 
 	pathFile := filepath.Join(outputDir, "cmd", strings.ToLower(cmdName)+".go")
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
+}
+
+func sanitizeVar(s string) string {
+	if s == "" {
+		return "param"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = "param"
+	}
+	// if it starts with a digit, prefix with underscore
+	if out[0] >= '0' && out[0] <= '9' {
+		out = "_" + out
+	}
+	return out
 }
 
 func writeMain(outputDir string, moduleName string, cmds []string) error {
