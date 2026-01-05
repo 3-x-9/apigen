@@ -20,37 +20,52 @@ Generate production-ready CLIs from OpenAPI specifications (MVP).
 
 ---
 
-## Quickstart — generate a CLI
+## Installation
 
-1. Build or run `apigen` from the project root:
+# Install apigen globally for repeated use:
 
 ```bash
-# run without installing
-go run . generate -s https://petstore3.swagger.io/api/v3/openapi.json -o ./petcli -m petcli
+# Install as a Go tool
+go install github.com/3-x-9/apigen@latest
 
-# or build and run
+# Verify installation
+apigen --help
+```
+
+# Or build locally:
+
+```bash
 go build -o apigen ./
-./apigen generate -s ./path/to/openapi.yaml -o ./outdir -m github.com/yourname/outdir
+./apigen --help
 ```
 
-2. Build the generated CLI:
+## Quickstart — Generate a CLI
 
+# Run the generator:
+
+Generate CLI from OpenAPI spec
 ```bash
-cd outdir
-go build -o mycli ./
-# run the generated CLI
-./mycli <command> --help
+apigen generate -s https://petstore3.swagger.io/api/v3/openapi.json \
+-o ./petcli -m petcli
 ```
 
-Example (petstore):
-
+# Build the generated CLI:
 ```bash
-go run . generate -s https://petstore3.swagger.io/api/v3/openapi.json -o ./petcli -m petcli
 cd petcli
+go mod tidy
+go build -o petcli ./
+# Run the CLI
+./petcli <command> --help
+```
+
+# Example (Petstore API):
+```bash
+apigen generate -s https://petstore3.swagger.io/api/v3/openapi.json -o ./petcli -m petcli
+cd petcli
+go mod tidy
 go build -o petcli ./
 ./petcli get_pet_findByStatus --status available
 ```
-
 ---
 
 ## Configuration & environment
