@@ -260,6 +260,60 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 	varDecls.WriteString("\tvar limit int\n\n")
 	flagsSetup.WriteString("\tcmd.Flags().IntVar(&limit, \"limit\", 10, \"Maximum number of items\")\n")
 
+	// add body flag for POST and PUT methods
+	var bodyHandling string
+	var headerHandling string
+	if strings.ToUpper(method) == "POST" || strings.ToUpper(method) == "PUT" || strings.ToUpper(method) == "PATCH" {
+		varDecls.WriteString("\tvar body string\n")
+		flagsSetup.WriteString("\tcmd.Flags().StringVarP(&body, \"body\", \"b\", \"\", \"Request body (raw JSON, @filename, or '-' for stdin)\")\n")
+		imports["io"] = true
+		imports["os"] = true
+		imports["bytes"] = true
+		bodyHandling = `
+			// prepare request body (allow raw JSON, @filename, or '-' for stdin)
+			var bodyReader io.Reader
+			if body != "" {
+				if strings.HasPrefix(body, "@") {
+					fname := strings.TrimPrefix(body, "@")
+					var data []byte
+					var err error
+					if fname == "-" {
+						data, err = ioutil.ReadAll(os.Stdin)
+						if err != nil {
+							return err
+						}
+					} else {
+						data, err = ioutil.ReadFile(fname)
+						if err != nil {
+							return err
+						}
+					}
+					bodyReader = bytes.NewReader(data)
+				} else if body == "-" {
+					data, err := ioutil.ReadAll(os.Stdin)
+					if err != nil {
+						return err
+					}
+					bodyReader = bytes.NewReader(data)
+				} else {
+					bodyReader = strings.NewReader(body)
+				}
+			}
+`
+		headerHandling = `
+			if bodyReader != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+`
+	} else if strings.ToUpper(method) == "GET" || strings.ToUpper(method) == "DELETE" {
+		// no body for GET/DELETE
+		imports["io"] = true
+		bodyHandling = `
+			var bodyReader io.Reader = nil
+`
+		headerHandling = ""
+	}
+
 	for _, pRef := range op.Parameters {
 		if pRef == nil || pRef.Value == nil {
 			continue
@@ -367,11 +421,13 @@ func New%sCmd() *cobra.Command {
 %s
             u.RawQuery = q.Encode()
             fullUrl := strings.TrimRight(cfg.BaseURL, "/") + u.String()
-            req, err := http.NewRequest("%s", fullUrl, nil)
+%s
+            req, err := http.NewRequest("%s", fullUrl, bodyReader)
             if err != nil {
                 return err
             }
-%s
+			%s
+			%s
             resp, err := http.DefaultClient.Do(req)
             if err != nil {
                 return err
@@ -396,7 +452,7 @@ func New%sCmd() *cobra.Command {
 %s
     return cmd
 }
-`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), strings.ToUpper(method), authCode, flagsSetup.String())
+`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), bodyHandling, strings.ToUpper(method), headerHandling, authCode, flagsSetup.String())
 
 	pathFile := filepath.Join(outputDir, "cmd", strings.ToLower(cmdName)+".go")
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
