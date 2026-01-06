@@ -28,6 +28,8 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 	var doc *openapi3.T
 	var err error
 
+	authType, authHeader := detectAuth(doc)
+
 	if isURL(specPath) {
 		parsedURL, err := url.Parse(specPath)
 		if err != nil {
@@ -74,7 +76,7 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 				continue
 			}
 			cmdName := sanitizeCommandName(path, method)
-			if err := writeEndpointCmd(outputDir, moduleName, cmdName, op, path, method); err != nil {
+			if err := writeEndpointCmd(outputDir, moduleName, cmdName, op, path, method, authType, authHeader); err != nil {
 				return err
 			}
 			cmdNames = append(cmdNames, cmdName)
@@ -87,6 +89,31 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 
 	fmt.Printf("Generated CLI in %s\n", outputDir)
 	return nil
+}
+
+func detectAuth(doc *openapi3.T) (authType string, headerName string) {
+	if doc == nil || doc.Components == nil || doc.Components.SecuritySchemes == nil {
+		return "", ""
+	}
+	for name, schemeRef := range doc.Components.SecuritySchemes {
+		if schemeRef == nil || schemeRef.Value == nil {
+			continue
+		}
+		s := schemeRef.Value
+
+		switch s.Type {
+		case "http":
+			if s.Scheme == "bearer" {
+				return "bearer", "Authorization"
+			}
+		case "apiKey":
+			if s.In == "header" {
+				return "apiKey", s.Name
+			}
+		}
+		_ = name
+	}
+	return "", ""
 }
 
 func createFolders(outputDir string) error {
@@ -198,7 +225,7 @@ func sanitizeCommandName(path, method string) string {
 	return strings.Title(method + "_" + path)
 }
 
-func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *openapi3.Operation, path, method string) error {
+func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *openapi3.Operation, path, method string, authType string, authHeader string) error {
 	// Build parameter-driven code pieces from the operation parameters
 	var imports = map[string]bool{
 		"fmt":                                true,
@@ -216,7 +243,19 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 	var pathReplacements strings.Builder
 	var queryBuild strings.Builder
 	var needStrconv bool
+	var authCode string
 
+	if authType == "bearer" {
+		authCode = `
+		if cfg.ApiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.ApiKey)
+		}
+		`
+	} else if authType == "apiKey" {
+		authCode = fmt.Sprintf(`
+		if cfg.ApiKey != "" {
+			req.Header.Set("%s", cfg.ApiKey)}`, authHeader)
+	}
 	// default common param used in many generated commands
 	varDecls.WriteString("\tvar limit int\n\n")
 	flagsSetup.WriteString("\tcmd.Flags().IntVar(&limit, \"limit\", 10, \"Maximum number of items\")\n")
@@ -315,44 +354,49 @@ import (
 )
 func New%sCmd() *cobra.Command {
 %s
-	cmd := &cobra.Command{
-		Use:   "%s",
-		Short: "%s",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := config.Load("%s")
-			pathWithParams := "%s"
+    cmd := &cobra.Command{
+        Use:   "%s",
+        Short: "%s",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            cfg := config.Load("%s")
+            pathWithParams := "%s"
 %s
-			// build URL and query params
-			u := url.URL{Path: pathWithParams}
-			q := url.Values{}
+            // build URL and query params
+            u := url.URL{Path: pathWithParams}
+            q := url.Values{}
 %s
-			u.RawQuery = q.Encode()
-			fullUrl := strings.TrimRight(cfg.BaseURL, "/") + u.String()
-			resp, err := http.Get(fullUrl)
-			if err != nil {
-				return err
-			}
-			defer resp.Body.Close()
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				return err
-			}
-			var pretty interface{}
-			if err := json.Unmarshal(body, &pretty); err != nil {
-				return err
-			}
-			prettyJSON, err := json.MarshalIndent(pretty, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Println(string(prettyJSON))
-			return nil
-		},
-	}
+            u.RawQuery = q.Encode()
+            fullUrl := strings.TrimRight(cfg.BaseURL, "/") + u.String()
+            req, err := http.NewRequest("%s", fullUrl, nil)
+            if err != nil {
+                return err
+            }
 %s
-	return cmd
+            resp, err := http.DefaultClient.Do(req)
+            if err != nil {
+                return err
+            }
+            defer resp.Body.Close()
+            body, err := ioutil.ReadAll(resp.Body)
+            if err != nil {
+                return err
+            }
+            var pretty interface{}
+            if err := json.Unmarshal(body, &pretty); err != nil {
+                return err
+            }
+            prettyJSON, err := json.MarshalIndent(pretty, "", "  ")
+            if err != nil {
+                return err
+            }
+            fmt.Println(string(prettyJSON))
+            return nil
+        },
+    }
+%s
+    return cmd
 }
-`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), flagsSetup.String())
+`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), strings.ToUpper(method), authCode, flagsSetup.String())
 
 	pathFile := filepath.Join(outputDir, "cmd", strings.ToLower(cmdName)+".go")
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)

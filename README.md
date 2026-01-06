@@ -36,7 +36,11 @@ apigen --help
 
 ```bash
 go build -o apigen ./
+<<<<<<< HEAD
 ./apigen --help
+=======
+./apigen generate -s ./path/to/openapi.yaml/json -o ./outdir -m github.com/yourname/outdir
+>>>>>>> f389288 (minor bugfix)
 ```
 
 ## Quickstart — Generate a CLI
