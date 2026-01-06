@@ -28,8 +28,6 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 	var doc *openapi3.T
 	var err error
 
-	authType, authHeader := detectAuth(doc)
-
 	if isURL(specPath) {
 		parsedURL, err := url.Parse(specPath)
 		if err != nil {
@@ -48,6 +46,8 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 		return err
 	}
 
+	authType, authHeader := detectAuth(doc)
+
 	// 2. Write go.mod
 	if err := writeGoMod(outputDir, moduleName); err != nil {
 		return err
@@ -57,7 +57,7 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 	if err := writeConfig(outputDir); err != nil {
 		return err
 	}
-	if err := writeRootCmd(outputDir); err != nil {
+	if err := writeRootCmd(outputDir, moduleName); err != nil {
 		return err
 	}
 
@@ -197,8 +197,8 @@ func Load(appName string) *Config {
 	return os.WriteFile(path, []byte(configCode), 0644)
 }
 
-func writeRootCmd(outputDir string) error {
-	rootCode := `
+func writeRootCmd(outputDir string, moduleName string) error {
+	rootCode := fmt.Sprintf(`
 	package cmd
 
 	import (
@@ -207,12 +207,12 @@ func writeRootCmd(outputDir string) error {
 
 	func NewRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "cli",
-		Short: "CLI is a command-line tool to interact with the API",
+		Use:   "%s",
+		Short: "%s is a command-line tool to interact with the API",
 		}
 		return cmd
 		}
-`
+`, moduleName, moduleName)
 	path := filepath.Join(outputDir, "cmd", "root.go")
 	return os.WriteFile(path, []byte(rootCode), 0644)
 }
@@ -223,6 +223,36 @@ func sanitizeCommandName(path, method string) string {
 	path = strings.ReplaceAll(path, "{", "")
 	path = strings.ReplaceAll(path, "}", "")
 	return strings.Title(method + "_" + path)
+}
+
+func chooseRequestContentType(op *openapi3.Operation) string {
+	if op == nil || op.RequestBody == nil || op.RequestBody.Value == nil {
+		return ""
+	}
+	prefs := []string{
+		"application/json",
+		"+json", // match suffix
+		"application/xml",
+		"application/x-www-form-urlencoded",
+		"multipart/form-data",
+	}
+	// direct matches first
+	for _, p := range prefs {
+		for ct := range op.RequestBody.Value.Content {
+			if p == "+json" {
+				if strings.HasSuffix(ct, "+json") {
+					return ct
+				}
+			} else if ct == p {
+				return ct
+			}
+		}
+	}
+	// fallback: return the first available content type
+	for ct := range op.RequestBody.Value.Content {
+		return ct
+	}
+	return ""
 }
 
 func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *openapi3.Operation, path, method string, authType string, authHeader string) error {
@@ -300,11 +330,11 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 				}
 			}
 `
-		headerHandling = `
+		headerHandling = fmt.Sprintf(`
 			if bodyReader != nil {
-				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Content-Type", "%s")
 			}
-`
+`, chooseRequestContentType(op))
 	} else if strings.ToUpper(method) == "GET" || strings.ToUpper(method) == "DELETE" {
 		// no body for GET/DELETE
 		imports["io"] = true
@@ -426,7 +456,7 @@ func New%sCmd() *cobra.Command {
             if err != nil {
                 return err
             }
-			%s
+%s
 			%s
             resp, err := http.DefaultClient.Do(req)
             if err != nil {
@@ -438,6 +468,8 @@ func New%sCmd() *cobra.Command {
                 return err
             }
             var pretty interface{}
+
+			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
             if err := json.Unmarshal(body, &pretty); err != nil {
                 return err
             }
@@ -446,6 +478,9 @@ func New%sCmd() *cobra.Command {
                 return err
             }
             fmt.Println(string(prettyJSON))
+			} else {
+			 	fmt.Println(string(body))
+			}
             return nil
         },
     }

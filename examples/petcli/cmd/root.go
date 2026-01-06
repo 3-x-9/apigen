@@ -7,8 +7,8 @@
 
 	func NewRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "cli",
-		Short: "CLI is a command-line tool to interact with the API",
+		Use:   "petcli",
+		Short: "petcli is a command-line tool to interact with the API",
 		}
 		return cmd
 		}
