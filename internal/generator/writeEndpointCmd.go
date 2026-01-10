@@ -94,7 +94,10 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 				replacement := fmt.Sprintf("strconv.FormatBool(%s)", varName)
 				queryBuild.WriteString(fmt.Sprintf("\tq.Set(\"%s\", %s)\n", name, replacement))
 				needStrconv = true
+			} else if strings.HasPrefix(goType, "[]") {
+				queryBuild.WriteString(fmt.Sprintf("\tfor _, v := range %s { q.Add(\"%s\", fmt.Sprintf(\"%%v\", v)) }\n", varName, name))
 			}
+
 		} else if in == "header" {
 			queryBuild.WriteString(fmt.Sprintf("\t// header param %s available in %s variable\n", name, varName))
 		}
@@ -156,7 +159,7 @@ func New%sCmd() *cobra.Command {
 				fmt.Printf("%%-15s: %%s\n", "Error", resp.Status)
 				fmt.Printf("%%-15s: %%s\n", "URL", resp.Request.URL.String())
 				fmt.Printf("%%-15s: %%s\n", "METHOD", resp.Request.Method)
-				fmt.Println("----------------------")
+				fmt.Println("----------------")
 }
 			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
             if err := json.Unmarshal(body, &pretty); err != nil {
