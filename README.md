@@ -84,6 +84,14 @@ go build -o petcli ./
 PETCLI_BASE_URL=https://api.example.com
 PETCLI_API_KEY=abcd
 ```
+```bash
+# Bash
+source <(petcli completion bash)
+
+# Zsh
+petcli completion zsh > ~/.zsh/completions/_petcli
+```
+
 
 - Note: `.env` files are not automatically loaded by `viper`. To add `.env` support, include `github.com/joho/godotenv` and call `godotenv.Load()` before `viper` is initialized in `config.Load()`.
 

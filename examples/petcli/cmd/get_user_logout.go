@@ -1,23 +1,20 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
 	"net/http"
-	"io/ioutil"
-	"net/url"
-	"io"
 	"encoding/json"
-	"strings"
 	"petcli/config"
 	"fmt"
+	"github.com/spf13/cobra"
+	"io"
+	"net/url"
+	"strings"
 
 )
-func NewGet_user_logoutCmd() *cobra.Command {
-	var limit int
-
+func NewGet_User_LogoutCmd() *cobra.Command {
 
     cmd := &cobra.Command{
-        Use:   "Get_user_logout",
+        Use:   "Get_User_Logout",
         Short: "Logs out current logged in user session.",
         RunE: func(cmd *cobra.Command, args []string) error {
             cfg := config.Load("petcli")
@@ -40,17 +37,35 @@ func NewGet_user_logoutCmd() *cobra.Command {
 			
 		if cfg.ApiKey != "" {
 			req.Header.Set("api_key", cfg.ApiKey)}
+
+			if Debug {
+				fmt.Println("---DEBUG INFO---")
+				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
+				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
+				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
+				fmt.Println("----------------------")
+			}
+
+			
+
             resp, err := http.DefaultClient.Do(req)
             if err != nil {
                 return err
             }
             defer resp.Body.Close()
-            body, err := ioutil.ReadAll(resp.Body)
+            body, err := io.ReadAll(resp.Body)
             if err != nil {
                 return err
             }
             var pretty interface{}
 
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				fmt.Println("Request failed:")
+				fmt.Printf("%-15s: %s\n", "Error", resp.Status)
+				fmt.Printf("%-15s: %s\n", "URL", resp.Request.URL.String())
+				fmt.Printf("%-15s: %s\n", "METHOD", resp.Request.Method)
+				fmt.Println("----------------------")
+}
 			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
             if err := json.Unmarshal(body, &pretty); err != nil {
                 return err
@@ -59,14 +74,13 @@ func NewGet_user_logoutCmd() *cobra.Command {
             if err != nil {
                 return err
             }
-            fmt.Println(string(prettyJSON))
+            fmt.Println("Response body:\n" + string(prettyJSON))
 			} else {
-			 	fmt.Println(string(body))
+			 	fmt.Println("Response body:\n" + string(body))
 			}
             return nil
         },
     }
-	cmd.Flags().IntVar(&limit, "limit", 10, "Maximum number of items")
 
     return cmd
 }

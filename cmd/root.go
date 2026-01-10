@@ -13,5 +13,6 @@ func Execute() error {
 }
 
 func init() {
+	rootCmd.CompletionOptions.DisableDefaultCmd = false
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
 }

@@ -1,26 +1,23 @@
 package cmd
 
 import (
-	"net/http"
-	"io/ioutil"
-	"strings"
-	"io"
-	"strconv"
-	"fmt"
-	"encoding/json"
-	"net/url"
 	"petcli/config"
+	"fmt"
+	"net/http"
+	"io"
+	"net/url"
+	"strconv"
 	"github.com/spf13/cobra"
+	"encoding/json"
+	"strings"
 
 )
-func NewDelete_pet_petIdCmd() *cobra.Command {
-	var limit int
-
+func NewDelete_Pet_PetIdCmd() *cobra.Command {
 	var api_key string
 	var petId int
 
     cmd := &cobra.Command{
-        Use:   "Delete_pet_petId",
+        Use:   "Delete_Pet_PetId",
         Short: "Deletes a pet.",
         RunE: func(cmd *cobra.Command, args []string) error {
             cfg := config.Load("petcli")
@@ -45,17 +42,35 @@ func NewDelete_pet_petIdCmd() *cobra.Command {
 			
 		if cfg.ApiKey != "" {
 			req.Header.Set("api_key", cfg.ApiKey)}
+
+			if Debug {
+				fmt.Println("---DEBUG INFO---")
+				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
+				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
+				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
+				fmt.Println("----------------------")
+			}
+
+			
+
             resp, err := http.DefaultClient.Do(req)
             if err != nil {
                 return err
             }
             defer resp.Body.Close()
-            body, err := ioutil.ReadAll(resp.Body)
+            body, err := io.ReadAll(resp.Body)
             if err != nil {
                 return err
             }
             var pretty interface{}
 
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				fmt.Println("Request failed:")
+				fmt.Printf("%-15s: %s\n", "Error", resp.Status)
+				fmt.Printf("%-15s: %s\n", "URL", resp.Request.URL.String())
+				fmt.Printf("%-15s: %s\n", "METHOD", resp.Request.Method)
+				fmt.Println("----------------------")
+}
 			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
             if err := json.Unmarshal(body, &pretty); err != nil {
                 return err
@@ -64,16 +79,16 @@ func NewDelete_pet_petIdCmd() *cobra.Command {
             if err != nil {
                 return err
             }
-            fmt.Println(string(prettyJSON))
+            fmt.Println("Response body:\n" + string(prettyJSON))
 			} else {
-			 	fmt.Println(string(body))
+			 	fmt.Println("Response body:\n" + string(body))
 			}
             return nil
         },
     }
-	cmd.Flags().IntVar(&limit, "limit", 10, "Maximum number of items")
 	cmd.Flags().StringVar(&api_key, "api_key", "", "header api_key parameter")
 	cmd.Flags().IntVar(&petId, "petId", 0, "path petId parameter")
+	cmd.MarkFlagRequired("petId")
 
     return cmd
 }

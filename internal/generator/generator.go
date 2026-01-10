@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"github.com/getkin/kin-openapi/openapi3"
 )
@@ -205,11 +206,14 @@ func writeRootCmd(outputDir string, moduleName string) error {
 		"github.com/spf13/cobra"
 	)
 
+	var Debug bool
+
 	func NewRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "%s",
 		Short: "%s is a command-line tool to interact with the API",
 		}
+		cmd.PersistentFlags().BoolVar(&Debug, "debug", false, "Debug mode Show request/response details")
 		return cmd
 		}
 `, moduleName, moduleName)
@@ -222,7 +226,16 @@ func sanitizeCommandName(path, method string) string {
 	path = strings.ReplaceAll(path, "/", "_")
 	path = strings.ReplaceAll(path, "{", "")
 	path = strings.ReplaceAll(path, "}", "")
-	return strings.Title(method + "_" + path)
+	parts := strings.Split(method+"_"+path, "_")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		r := []rune(p)
+		r[0] = unicode.ToUpper(r[0])
+		parts[i] = string(r)
+	}
+	return strings.Join(parts, "_")
 }
 
 func chooseRequestContentType(op *openapi3.Operation) string {
@@ -262,7 +275,7 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		"github.com/spf13/cobra":             true,
 		fmt.Sprintf("%s/config", moduleName): true,
 		"net/http":                           true,
-		"io/ioutil":                          true,
+		"io":                                 true,
 		"encoding/json":                      true,
 		"net/url":                            true,
 		"strings":                            true,
@@ -286,19 +299,16 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		if cfg.ApiKey != "" {
 			req.Header.Set("%s", cfg.ApiKey)}`, authHeader)
 	}
-	// default common param used in many generated commands
-	varDecls.WriteString("\tvar limit int\n\n")
-	flagsSetup.WriteString("\tcmd.Flags().IntVar(&limit, \"limit\", 10, \"Maximum number of items\")\n")
 
 	// add body flag for POST and PUT methods
 	var bodyHandling string
 	var headerHandling string
+	var debugHandling string
 	if strings.ToUpper(method) == "POST" || strings.ToUpper(method) == "PUT" || strings.ToUpper(method) == "PATCH" {
 		varDecls.WriteString("\tvar body string\n")
 		flagsSetup.WriteString("\tcmd.Flags().StringVarP(&body, \"body\", \"b\", \"\", \"Request body (raw JSON, @filename, or '-' for stdin)\")\n")
-		imports["io"] = true
-		imports["os"] = true
 		imports["bytes"] = true
+		imports["os"] = true
 		bodyHandling = `
 			// prepare request body (allow raw JSON, @filename, or '-' for stdin)
 			var bodyReader io.Reader
@@ -308,19 +318,19 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 					var data []byte
 					var err error
 					if fname == "-" {
-						data, err = ioutil.ReadAll(os.Stdin)
+						data, err = io.ReadAll(os.Stdin)
 						if err != nil {
 							return err
 						}
 					} else {
-						data, err = ioutil.ReadFile(fname)
+						data, err = os.ReadFile(fname)
 						if err != nil {
 							return err
 						}
 					}
 					bodyReader = bytes.NewReader(data)
 				} else if body == "-" {
-					data, err := ioutil.ReadAll(os.Stdin)
+					data, err := io.ReadAll(os.Stdin)
 					if err != nil {
 						return err
 					}
@@ -328,6 +338,36 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 				} else {
 					bodyReader = strings.NewReader(body)
 				}
+			}
+`
+		debugHandling = `				
+			if Debug {
+				fmt.Println("---DEBUG INFO---")
+				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
+				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
+				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
+				if bodyReader != nil {
+					data, err := io.ReadAll(bodyReader)
+					if err != nil {
+						return err
+					}
+
+					var parsed interface{}
+					if json.Unmarshal(data, &parsed) == nil {
+						prettyDebugJSON, err := json.MarshalIndent(parsed, "", "  ")
+						if err != nil {
+							return err
+						}
+					fmt.Printf("Request Body:\n%s\n", prettyDebugJSON)
+					} else {
+						fmt.Printf("Request Body:\n%s\n", string(data))
+					}
+					bodyReader = bytes.NewReader(data) // reset bodyReader
+					
+					} else {
+						fmt.Printf("Request Body: (empty)\n")
+					}
+				fmt.Println("----------------------")
 			}
 `
 		headerHandling = fmt.Sprintf(`
@@ -340,6 +380,15 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		imports["io"] = true
 		bodyHandling = `
 			var bodyReader io.Reader = nil
+`
+		debugHandling = `
+			if Debug {
+				fmt.Println("---DEBUG INFO---")
+				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
+				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
+				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
+				fmt.Println("----------------------")
+			}
 `
 		headerHandling = ""
 	}
@@ -390,7 +439,11 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		} else if goType == "bool" {
 			defaultVal = "false"
 		}
+
 		flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
+		if pRef.Value.Required || p.In == "path" {
+			flagsSetup.WriteString(fmt.Sprintf("\tcmd.MarkFlagRequired(\"%s\")\n", name))
+		}
 
 		// code to handle where the param goes
 		if in == "path" {
@@ -458,17 +511,27 @@ func New%sCmd() *cobra.Command {
             }
 %s
 			%s
+%s
+			
+
             resp, err := http.DefaultClient.Do(req)
             if err != nil {
                 return err
             }
             defer resp.Body.Close()
-            body, err := ioutil.ReadAll(resp.Body)
+            body, err := io.ReadAll(resp.Body)
             if err != nil {
                 return err
             }
             var pretty interface{}
 
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				fmt.Println("Request failed:")
+				fmt.Printf("%%-15s: %%s\n", "Error", resp.Status)
+				fmt.Printf("%%-15s: %%s\n", "URL", resp.Request.URL.String())
+				fmt.Printf("%%-15s: %%s\n", "METHOD", resp.Request.Method)
+				fmt.Println("----------------------")
+}
 			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
             if err := json.Unmarshal(body, &pretty); err != nil {
                 return err
@@ -477,9 +540,9 @@ func New%sCmd() *cobra.Command {
             if err != nil {
                 return err
             }
-            fmt.Println(string(prettyJSON))
+            fmt.Println("Response body:\n" + string(prettyJSON))
 			} else {
-			 	fmt.Println(string(body))
+			 	fmt.Println("Response body:\n" + string(body))
 			}
             return nil
         },
@@ -487,7 +550,7 @@ func New%sCmd() *cobra.Command {
 %s
     return cmd
 }
-`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), bodyHandling, strings.ToUpper(method), headerHandling, authCode, flagsSetup.String())
+`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), bodyHandling, strings.ToUpper(method), headerHandling, authCode, debugHandling, flagsSetup.String())
 
 	pathFile := filepath.Join(outputDir, "cmd", strings.ToLower(cmdName)+".go")
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
