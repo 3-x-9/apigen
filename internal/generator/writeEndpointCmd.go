@@ -26,6 +26,7 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 	var flagsSetup strings.Builder
 	var pathReplacements strings.Builder
 	var queryBuild strings.Builder
+	var schemaBodyBuild strings.Builder
 	var needStrconv bool
 	var authCode string
 
@@ -41,7 +42,9 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 			req.Header.Set("%s", cfg.ApiKey)}`, authHeader)
 	}
 
-	bodyHandling, headerHandling, debugHandling := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup)
+	generateBodyFlagsFromSchema(op, &flagsSetup, &varDecls, &schemaBodyBuild)
+
+	bodyHandling, headerHandling, debugHandling := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup, &schemaBodyBuild)
 
 	for _, pRef := range op.Parameters {
 		if pRef == nil || pRef.Value == nil {
@@ -50,6 +53,14 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		p := pRef.Value
 		name := p.Name
 		in := p.In
+
+		// detect explode in arrayt
+		explode := false
+		if p.Style != "" {
+			if p.Style == "form" && p.Explode != nil {
+				explode = *p.Explode
+			}
+		}
 
 		// init and default values to string
 		goType := "string"
@@ -95,7 +106,11 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 				queryBuild.WriteString(fmt.Sprintf("\tq.Set(\"%s\", %s)\n", name, replacement))
 				needStrconv = true
 			} else if strings.HasPrefix(goType, "[]") {
-				queryBuild.WriteString(fmt.Sprintf("\tfor _, v := range %s { q.Add(\"%s\", fmt.Sprintf(\"%%v\", v)) }\n", varName, name))
+				if explode {
+					queryBuild.WriteString(fmt.Sprintf("\tfor _, v := range %s { q.Add(\"%s\", fmt.Sprintf(\"%%v\", v)) }\n", varName, name))
+				} else {
+					queryBuild.WriteString(fmt.Sprintf("\tif %s != nil { q.Set(\"%s\", strings.Join(func() []string { res := []string{}; for _, v := range %s { res = append(res, fmt.Sprintf(\"%%v\", v)) }; return res }(), \",\")) }\n", varName, name, varName))
+				}
 			}
 
 		} else if in == "header" {
@@ -185,7 +200,7 @@ func New%sCmd() *cobra.Command {
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
 }
 
-func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[string]bool, varDecls *strings.Builder, flagsSetup *strings.Builder) (string, string, string) {
+func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[string]bool, varDecls *strings.Builder, flagsSetup *strings.Builder, schemaBodyBuild *strings.Builder) (string, string, string) {
 	var bodyHandling string
 	var headerHandling string
 	var debugHandling string
@@ -194,7 +209,7 @@ func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[
 		flagsSetup.WriteString("\tcmd.Flags().StringVarP(&body, \"body\", \"b\", \"\", \"Request body (raw JSON, @filename, or '-' for stdin)\")\n")
 		imports["bytes"] = true
 		imports["os"] = true
-		bodyHandling = `
+		bodyHandling = fmt.Sprintf(`
 			// prepare request body (allow raw JSON, @filename, or '-' for stdin)
 			var bodyReader io.Reader
 			if body != "" {
@@ -221,10 +236,12 @@ func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[
 					}
 					bodyReader = bytes.NewReader(data)
 				} else {
-					bodyReader = strings.NewReader(body)
+					bodyReader = bytes.NewReader([]byte(body))
 				}
+			} else {
+			 %s
 			}
-`
+`, schemaBodyBuild)
 		debugHandling = buildDebugHandling(method)
 
 		headerHandling = fmt.Sprintf(`
@@ -349,4 +366,118 @@ func FlagVars(goType string, flagFunc string, p *openapi3.Parameter, imports map
 		}
 	}
 	return goType, flagFunc
+}
+
+func mapSchemaToFlag(prop *openapi3.Schema) (string, string) {
+	// Default to string
+	goType := "string"
+	flagFunc := "StringVar"
+	if prop == nil || prop.Type == nil || len(*prop.Type) == 0 {
+		return goType, flagFunc
+	}
+	switch (*prop.Type)[0] {
+	case "array":
+		if prop.Items != nil &&
+			prop.Items.Value != nil &&
+			prop.Items.Value.Type != nil &&
+			len(*prop.Items.Value.Type) > 0 {
+
+			switch (*prop.Items.Value.Type)[0] {
+			case "integer":
+				goType = "[]int"
+				flagFunc = "IntSliceVar"
+			case "boolean":
+				goType = "[]bool"
+				flagFunc = "BoolSliceVar"
+			default:
+				goType = "[]string"
+				flagFunc = "StringSliceVar"
+			}
+		}
+
+	case "string":
+		goType = "string"
+		flagFunc = "StringVar"
+	case "integer":
+		goType = "int"
+		flagFunc = "IntVar"
+	case "boolean":
+		goType = "bool"
+		flagFunc = "BoolVar"
+	default:
+		// default to string for unknown types
+		goType = "string"
+		flagFunc = "StringVar"
+	}
+	return goType, flagFunc
+}
+
+func generateBodyFlagsFromSchema(op *openapi3.Operation, flagsSetup *strings.Builder, varDecls *strings.Builder, SchemaBodyFlag *strings.Builder) {
+	if op.RequestBody == nil || op.RequestBody.Value == nil || op.RequestBody.Value.Content == nil {
+		return
+	}
+	content := op.RequestBody.Value.Content.Get("application/json")
+	if content == nil || content.Schema == nil || content.Schema.Value == nil {
+		return
+	}
+	schema := content.Schema.Value
+	if schema.Type != nil && len(*schema.Type) > 0 {
+		SchemaBodyFlag.WriteString(`bodyObj := map[string]interface{}{}
+		`)
+		switch (*schema.Type)[0] {
+		case "object":
+			for propName, propRef := range schema.Properties {
+				propSchema := propRef.Value
+				key := propName
+				if propSchema == nil || propSchema.Type == nil {
+					continue
+				}
+
+				varName := sanitizeVar(propName)
+				varName += "Body"
+
+				goType, flagFunc := mapSchemaToFlag(propSchema)
+
+				varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
+
+				desc := propSchema.Description
+				if desc == "" {
+					desc = propName + " parameter"
+				}
+
+				if len(propSchema.Enum) > 0 {
+					desc += fmt.Sprintf(" (one of: %v)", propSchema.Enum)
+				}
+				propName = "body-" + propName
+				flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s\")\n",
+					flagFunc,
+					varName,
+					propName,
+					defaultForType(goType),
+					desc))
+
+				for _, req := range schema.Required {
+					if req == propName {
+						flagsSetup.WriteString(fmt.Sprintf("\tcmd.MarkFlagRequired(\"%s\")\n", propName))
+						break
+					}
+				}
+
+				buildRequestBodyFromSchemaFlags(SchemaBodyFlag, key, varName, defaultForType(goType))
+			}
+		}
+	}
+	SchemaBodyFlag.WriteString(`data, err := json.Marshal(bodyObj)
+								if err != nil {
+									return err
+								}
+								bodyReader = bytes.NewReader(data)`)
+}
+
+func buildRequestBodyFromSchemaFlags(schemaBodyBuild *strings.Builder, key string, varName string, varType string) {
+	schemaBodyBuild.WriteString(fmt.Sprintf(`
+	if %s != %s {
+		bodyObj["%s"] = %s
+	}
+`, varName, varType, key, varName))
 }
