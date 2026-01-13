@@ -29,6 +29,7 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 	var schemaBodyBuild strings.Builder
 	var needStrconv bool
 	var authCode string
+	var requiredChecks strings.Builder
 
 	if authType == "bearer" {
 		authCode = `
@@ -42,9 +43,9 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 			req.Header.Set("%s", cfg.ApiKey)}`, authHeader)
 	}
 
-	generateBodyFlagsFromSchema(op, &flagsSetup, &varDecls, &schemaBodyBuild)
+	generateBodyFlagsFromSchema(op, &flagsSetup, &varDecls, &schemaBodyBuild, &requiredChecks)
 
-	bodyHandling, headerHandling, debugHandling := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup, &schemaBodyBuild)
+	bodyHandling, headerHandling, debugHandling := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup, &schemaBodyBuild, &requiredChecks)
 
 	for _, pRef := range op.Parameters {
 		if pRef == nil || pRef.Value == nil {
@@ -200,7 +201,8 @@ func New%sCmd() *cobra.Command {
 	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
 }
 
-func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[string]bool, varDecls *strings.Builder, flagsSetup *strings.Builder, schemaBodyBuild *strings.Builder) (string, string, string) {
+func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[string]bool, varDecls *strings.Builder, flagsSetup *strings.Builder,
+	schemaBodyBuild *strings.Builder, requiredChecks *strings.Builder) (string, string, string) {
 	var bodyHandling string
 	var headerHandling string
 	var debugHandling string
@@ -240,8 +242,11 @@ func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[
 				}
 			} else {
 			 %s
+			if body == "" {
+				%s
+				}	
 			}
-`, schemaBodyBuild)
+`, schemaBodyBuild, requiredChecks)
 		debugHandling = buildDebugHandling(method)
 
 		headerHandling = fmt.Sprintf(`
@@ -404,6 +409,9 @@ func mapSchemaToFlag(prop *openapi3.Schema) (string, string) {
 	case "boolean":
 		goType = "bool"
 		flagFunc = "BoolVar"
+	case "object":
+		goType = "map[string]interface{}"
+		flagFunc = "StringVar"
 	default:
 		// default to string for unknown types
 		goType = "string"
@@ -412,7 +420,8 @@ func mapSchemaToFlag(prop *openapi3.Schema) (string, string) {
 	return goType, flagFunc
 }
 
-func generateBodyFlagsFromSchema(op *openapi3.Operation, flagsSetup *strings.Builder, varDecls *strings.Builder, SchemaBodyFlag *strings.Builder) {
+func generateBodyFlagsFromSchema(op *openapi3.Operation, flagsSetup *strings.Builder, varDecls *strings.Builder,
+	SchemaBodyFlag *strings.Builder, requiredChecks *strings.Builder) {
 	if op.RequestBody == nil || op.RequestBody.Value == nil || op.RequestBody.Value.Content == nil {
 		return
 	}
@@ -426,58 +435,110 @@ func generateBodyFlagsFromSchema(op *openapi3.Operation, flagsSetup *strings.Bui
 		`)
 		switch (*schema.Type)[0] {
 		case "object":
-			for propName, propRef := range schema.Properties {
-				propSchema := propRef.Value
-				key := propName
-				if propSchema == nil || propSchema.Type == nil {
-					continue
-				}
-
-				varName := sanitizeVar(propName)
-				varName += "Body"
-
-				goType, flagFunc := mapSchemaToFlag(propSchema)
-
-				varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
-
-				desc := propSchema.Description
-				if desc == "" {
-					desc = propName + " parameter"
-				}
-
-				if len(propSchema.Enum) > 0 {
-					desc += fmt.Sprintf(" (one of: %v)", propSchema.Enum)
-				}
-				propName = "body-" + propName
-				flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s\")\n",
-					flagFunc,
-					varName,
-					propName,
-					defaultForType(goType),
-					desc))
-
-				for _, req := range schema.Required {
-					if req == propName {
-						flagsSetup.WriteString(fmt.Sprintf("\tcmd.MarkFlagRequired(\"%s\")\n", propName))
-						break
-					}
-				}
-
-				buildRequestBodyFromSchemaFlags(SchemaBodyFlag, key, varName, defaultForType(goType))
-			}
+			flagStr := "body"
+			varStr := "body"
+			itterateProperties(schema, flagsSetup, varDecls, SchemaBodyFlag, flagStr, varStr, requiredChecks)
 		}
 	}
-	SchemaBodyFlag.WriteString(`data, err := json.Marshal(bodyObj)
+	SchemaBodyFlag.WriteString(`if body == "" && len(bodyObj) <= 0 {
+									return fmt.Errorf("request body is required (use either --body or body flags!!!)")
+								}
+								data, err := json.Marshal(bodyObj)
 								if err != nil {
 									return err
 								}
-								bodyReader = bytes.NewReader(data)`)
+								bodyReader = bytes.NewReader(data)
+								`)
 }
 
-func buildRequestBodyFromSchemaFlags(schemaBodyBuild *strings.Builder, key string, varName string, varType string) {
+func buildRequestBodyFromSchemaFlags(schemaBodyBuild *strings.Builder, varName string, varType string) {
 	schemaBodyBuild.WriteString(fmt.Sprintf(`
 	if %s != %s {
 		bodyObj["%s"] = %s
 	}
-`, varName, varType, key, varName))
+`, varName, varType, varName, varName))
+}
+
+func isObjectSchema(s *openapi3.Schema) bool {
+	if s == nil || s.Type == nil {
+		return false
+	}
+	for _, t := range *s.Type {
+		if t == "object" {
+			return true
+		}
+	}
+	return false
+}
+
+func itterateProperties(schema *openapi3.Schema, flagsSetup *strings.Builder, varDecls *strings.Builder, SchemaBodyFlag *strings.Builder,
+	flagStr string, varStr string, requiredChecks *strings.Builder) {
+	for propName, propRef := range schema.Properties {
+		if propRef != nil && propRef.Value != nil && propRef.Value.Type != nil && len(*propRef.Value.Type) > 0 {
+
+			if (*propRef.Value.Type)[0] == "object" {
+				childFlagStr := fmt.Sprintf("%s-%s", flagStr, propName)
+				childVarStr := fmt.Sprintf("%s_%s", varStr, propName)
+				itterateProperties(propRef.Value, flagsSetup, varDecls, SchemaBodyFlag, childFlagStr, childVarStr, requiredChecks)
+				continue
+			}
+
+		}
+		propSchema := propRef.Value
+		if propSchema == nil || propSchema.Type == nil {
+			continue
+		}
+
+		varName := sanitizeVar(propName + "_" + varStr)
+
+		goType, flagFunc := mapSchemaToFlag(propSchema)
+
+		varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
+
+		desc := propSchema.Description
+		if desc == "" {
+			desc = propName + " parameter"
+		}
+
+		if len(propSchema.Enum) > 0 {
+			desc += fmt.Sprintf(" (one of: %v)", propSchema.Enum)
+		}
+
+		propName = flagStr + "-" + propName
+		flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s\")\n",
+			flagFunc,
+			varName,
+			propName,
+			defaultForType(goType),
+			desc))
+
+		buildRequestBodyFromSchemaFlags(SchemaBodyFlag, varName, defaultForType(goType))
+	}
+	generateRequiredChecks(schema, "bodyObj", requiredChecks)
+}
+
+func generateRequiredChecks(schema *openapi3.Schema, parentVar string, builder *strings.Builder) {
+	for _, reqName := range schema.Required {
+		propRef := schema.Properties[reqName]
+		if propRef == nil || propRef.Value == nil {
+			continue
+		}
+		reqName += "_body"
+		childVar := fmt.Sprintf("%s[\"%s\"]", parentVar, reqName)
+		if isObjectSchema(propRef.Value) {
+			builder.WriteString(fmt.Sprintf(`
+nested, ok := %s.(map[string]interface{})
+if !ok {
+    return fmt.Errorf("missing required object: %s")
+}
+`, childVar, reqName))
+			generateRequiredChecks(propRef.Value, "nested", builder)
+		} else {
+			builder.WriteString(fmt.Sprintf(`
+if _, ok := %s; !ok {
+    return fmt.Errorf("missing required field: %s")
+}
+`, childVar, reqName))
+		}
+	}
 }
