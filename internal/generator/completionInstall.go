@@ -1,7 +1,6 @@
 package generator
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 
@@ -25,8 +24,6 @@ func InstallBashCompletion(rootCmd *cobra.Command, moduleName string) error {
 		return err
 	}
 	defer f.Close()
-
-	fmt.Println("Reached generation")
 
 	return rootCmd.GenBashCompletion(f)
 }

@@ -5,21 +5,33 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
 type Config struct {
 	BaseURL string
-	ApiKey string
 	Output string
+	Timeout time.Duration
+	Petstore_authAuth string
+	Api_keyAuth string
+
 }
 
-func Load(appName string) *Config {
+func Load(appName string, env string) *Config {
+	_ = godotenv.Load()
 	v := viper.New()
 
-	v.SetDefault("base_url", "http://localhost:8080")
+		serverMap := map[string]string{"/api/v3": "/api/v3"}
+
+	v.SetDefault("base_url", "/api/v3")
 	v.SetDefault("output", "json")
+	v.SetDefault("timeout", "30s")
+	v.SetDefault("petstore_auth_auth", "")
+	v.SetDefault("api_key_auth", "")
+
 
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
@@ -35,9 +47,24 @@ func Load(appName string) *Config {
 
 	_ = v.ReadInConfig()
 
+	baseUrl := v.GetString("base_url")
+	if env != "" {
+		if url, ok := serverMap[strings.ToLower(env)]; ok {
+			baseUrl = url
+		}
+	}
+
+	timeout, _ := time.ParseDuration(v.GetString("timeout"))
+	if timeout == 0 {
+		timeout = 30 * time.Second
+	}
+
 	return &Config{
-		BaseURL: v.GetString("base_url"),
-		ApiKey: v.GetString("api_key"),
+		BaseURL: baseUrl,
 		Output: v.GetString("output"),
+		Timeout: timeout,
+		Petstore_authAuth: v.GetString("petstore_auth_auth"),
+		Api_keyAuth: v.GetString("api_key_auth"),
+
 	}
 }

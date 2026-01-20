@@ -1,17 +1,26 @@
+package cmd
 
-	package cmd
+import (
+	"github.com/spf13/cobra"
+)
 
-	import (
-		"github.com/spf13/cobra"
-	)
+var Debug bool
+var Env string
+var Output string
 
-	var Debug bool
-
-	func NewRootCmd() *cobra.Command {
+func NewRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "petcli",
 		Short: "petcli is a command-line tool to interact with the API",
-		}
-		cmd.PersistentFlags().BoolVar(&Debug, "debug", false, "Debug mode Show request/response details")
-		return cmd
-		}
+		CompletionOptions: cobra.CompletionOptions{
+			DisableDefaultCmd: false,
+			HiddenDefaultCmd:  false,
+		},
+	}
+	
+	cmd.PersistentFlags().BoolVar(&Debug, "debug", false, "Debug mode Show request/response details")
+	cmd.PersistentFlags().StringVar(&Env, "env", "", "Environment to use (e.g. production, staging)")
+	cmd.PersistentFlags().StringVar(&Output, "output", "pretty", "Output format (pretty, json, table, csv)")
+
+	return cmd
+}
