@@ -1,9 +1,13 @@
 package cmd
 
 import (
-	"github.com/3-x-9/apigen/internal/generator"
+	"fmt"
+
+	generator "github.com/3-x-9/apigen/internal/generator"
 	"github.com/spf13/cobra"
 )
+
+var installCompletion bool
 
 var generateCmd = &cobra.Command{
 	Use:   "generate",
@@ -23,6 +27,14 @@ var generateCmd = &cobra.Command{
 			return err
 		}
 
+		installCompletion, err := cmd.Flags().GetBool("installCompletion")
+		if installCompletion {
+			if err := generator.InstallBashCompletion(cmd, moduleName); err != nil {
+				fmt.Println(err)
+				return err
+			}
+		}
+
 		gen := generator.NewGenerator()
 		return gen.Generate(specPath, outputDir, moduleName)
 	},
@@ -36,4 +48,5 @@ func init() {
 	generateCmd.Flags().StringP("out", "o", "./cli-out", "Output directory for the generated code")
 	generateCmd.Flags().StringP("module", "m", "", "Module name for the generated code")
 	generateCmd.MarkFlagRequired("module")
+	generateCmd.Flags().BoolVar(&installCompletion, "install-completion", false, "install a completion file to /etc/bash_completion.d/<module>")
 }

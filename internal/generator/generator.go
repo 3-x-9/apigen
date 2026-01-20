@@ -9,6 +9,11 @@ import (
 
 type Generator struct{}
 
+type CommandInfo struct {
+	GoName  string
+	CLIName string
+}
+
 func NewGenerator() *Generator {
 	return &Generator{}
 }
@@ -43,7 +48,8 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 		return err
 	}
 
-	authType, authHeader := detectAuth(doc)
+	// 4. Detect Auth
+	schemes := detectAuth(doc)
 
 	// 2. Write go.mod
 	if err := writeGoMod(outputDir, moduleName); err != nil {
@@ -51,15 +57,18 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 	}
 
 	// 3. Write config and root cmd
-	if err := writeConfig(outputDir); err != nil {
+	if err := writeConfig(outputDir, schemes, doc.Servers); err != nil {
 		return err
 	}
 	if err := writeRootCmd(outputDir, moduleName); err != nil {
 		return err
 	}
 
-	// 4. Iterate paths and operations
-	var cmdNames []string
+	if err := writeModels(outputDir, doc); err != nil {
+		return err
+	}
+
+	tagToCmds := make(map[string][]CommandInfo)
 	for path, pathItem := range doc.Paths.Map() {
 		ops := map[string]*openapi3.Operation{
 			"get":    pathItem.Get,
@@ -72,15 +81,29 @@ func (g *Generator) Generate(specPath, outputDir string, moduleName string) erro
 			if op == nil {
 				continue
 			}
-			cmdName := sanitizeCommandName(path, method)
-			if err := writeEndpointCmd(outputDir, moduleName, cmdName, op, path, method, authType, authHeader); err != nil {
+
+			tag := "Misc"
+			if len(op.Tags) > 0 {
+				tag = op.Tags[0]
+			}
+
+			goName := sanitizeCommandName(path, method)
+			cliName := sanitizeCLIName(path, method)
+			if err := writeEndpointCmd(outputDir, moduleName, goName, cliName, op, path, method, schemes, &doc.Security); err != nil {
 				return err
 			}
-			cmdNames = append(cmdNames, cmdName)
+
+			tagToCmds[tag] = append(tagToCmds[tag], CommandInfo{GoName: goName, CLIName: cliName})
 		}
 	}
 
-	if err := writeMain(outputDir, moduleName, cmdNames); err != nil {
+	for tag := range tagToCmds {
+		if err := writeTagCmd(outputDir, tag); err != nil {
+			return err
+		}
+	}
+
+	if err := writeMain(outputDir, moduleName, tagToCmds); err != nil {
 		return err
 	}
 

@@ -36,11 +36,10 @@ apigen --help
 
 ```bash
 go build -o apigen ./
-<<<<<<< HEAD
 ./apigen --help
-=======
+
+# Generate a CLI
 ./apigen generate -s ./path/to/openapi.yaml/json -o ./outdir -m github.com/yourname/outdir
->>>>>>> f389288 (minor bugfix)
 ```
 
 ## Quickstart — Generate a CLI
@@ -92,6 +91,12 @@ source <(petcli completion bash)
 petcli completion zsh > ~/.zsh/completions/_petcli
 ```
 
+> **Note for local development**:
+> If you are running the binary locally (e.g., `./petcli`), the completion script might not work because it expects the command to be `petcli`.
+> To fix this, you can either:
+> 1. Add the current directory to your PATH: `export PATH=$PWD:$PATH`
+> 2. Or install the binary: `go install .`
+
 
 - Note: `.env` files are not automatically loaded by `viper`. To add `.env` support, include `github.com/joho/godotenv` and call `godotenv.Load()` before `viper` is initialized in `config.Load()`.
 
@@ -110,12 +115,7 @@ Edge cases (arrays, complex serialization, multipart bodies) are not fully imple
 
 ## Contributing
 
-Contributions are welcome. Suggested starters:
-
-- Improve parameter serialization (arrays, explode semantics)
-- Add authentication handling (Bearer, API keys) to generated clients
-- Add `.env` loading option to generated `config.Load()`
-- Add tests for generator output using small OpenAPI fixtures
+Contributions are welcome.
 
 Steps to contribute:
 

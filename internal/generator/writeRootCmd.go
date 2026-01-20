@@ -1,30 +1,22 @@
 package generator
 
 import (
-	"fmt"
+	"bytes"
 	"os"
 	"path/filepath"
 )
 
 func writeRootCmd(outputDir string, moduleName string) error {
-	rootCode := fmt.Sprintf(`
-	package cmd
+	var buf bytes.Buffer
+	data := struct {
+		ModuleName string
+	}{
+		ModuleName: moduleName,
+	}
 
-	import (
-		"github.com/spf13/cobra"
-	)
-
-	var Debug bool
-
-	func NewRootCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "%s",
-		Short: "%s is a command-line tool to interact with the API",
-		}
-		cmd.PersistentFlags().BoolVar(&Debug, "debug", false, "Debug mode Show request/response details")
-		return cmd
-		}
-`, moduleName, moduleName)
+	if err := RootTmpl.Execute(&buf, data); err != nil {
+		return err
+	}
 	path := filepath.Join(outputDir, "cmd", "root.go")
-	return os.WriteFile(path, []byte(rootCode), 0644)
+	return os.WriteFile(path, buf.Bytes(), 0644)
 }

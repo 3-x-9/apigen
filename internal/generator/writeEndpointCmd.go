@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,17 +10,22 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *openapi3.Operation, path, method string, authType string, authHeader string) error {
+func writeEndpointCmd(outputDir string, moduleName string, goName string, cliName string, op *openapi3.Operation, path, method string,
+	schemes map[string]AuthScheme, globalSecurity *openapi3.SecurityRequirements) error {
 	// Build parameter-driven code pieces from the operation parameters
 	var imports = map[string]bool{
-		"fmt":                                true,
 		"github.com/spf13/cobra":             true,
 		fmt.Sprintf("%s/config", moduleName): true,
+		fmt.Sprintf("%s/utils", moduleName):  true,
 		"net/http":                           true,
 		"io":                                 true,
-		"encoding/json":                      true,
 		"net/url":                            true,
 		"strings":                            true,
+	}
+
+	respModel, isArray := detectResponseModel(op)
+	if respModel != "" {
+		imports[fmt.Sprintf("%s/models", moduleName)] = true
 	}
 
 	var varDecls strings.Builder
@@ -27,26 +33,125 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 	var pathReplacements strings.Builder
 	var queryBuild strings.Builder
 	var schemaBodyBuild strings.Builder
-	var needStrconv bool
-	var authCode string
-	var requiredChecks strings.Builder
+	var validationBuild strings.Builder
 
-	if authType == "bearer" {
-		authCode = `
-		if cfg.ApiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+cfg.ApiKey)
-		}
-		`
-	} else if authType == "apiKey" {
-		authCode = fmt.Sprintf(`
-		if cfg.ApiKey != "" {
-			req.Header.Set("%s", cfg.ApiKey)}`, authHeader)
+	var headerBuild strings.Builder
+	var cookieBuild strings.Builder
+
+	// Determine security requirements: Op level overrides Global
+	security := globalSecurity
+	if op.Security != nil {
+		security = op.Security
 	}
 
-	generateBodyFlagsFromSchema(op, &flagsSetup, &varDecls, &schemaBodyBuild, &requiredChecks)
+	// Find the first matching scheme
 
-	bodyHandling, headerHandling, debugHandling := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup, &schemaBodyBuild, &requiredChecks)
+	authCode := findScheme(security, schemes, &cookieBuild, &queryBuild)
 
+	generateBodyFlagsFromSchema(op, &flagsSetup, &varDecls, &schemaBodyBuild, &validationBuild, imports)
+
+	bodyHandling, headerHandling, _ := buildBodyHeaderHandling(method, op, imports, &varDecls, &flagsSetup, &schemaBodyBuild, &validationBuild)
+
+	buildPathParams(*op, &varDecls, &flagsSetup, &pathReplacements, &queryBuild, &headerBuild, &cookieBuild, &validationBuild, imports)
+
+	var importList []string
+	for imp := range imports {
+		importList = append(importList, imp)
+	}
+
+	writePkgUtil(outputDir)
+
+	err := buildCmdCode(CmdConfig{
+		Method:           strings.ToUpper(method),
+		GoName:           goName,
+		CommandName:      cliName,
+		ModuleName:       moduleName,
+		Path:             path,
+		OutputDir:        outputDir,
+		Short:            op.Summary,
+		VarDecls:         varDecls.String(),
+		PathReplacements: pathReplacements.String(),
+		QueryBuild:       queryBuild.String(),
+		HeaderBuild:      headerBuild.String(),
+		CookieBuild:      cookieBuild.String(),
+		FlagsSetup:       flagsSetup.String(),
+		Imports:          importList,
+		BodyHandling:     bodyHandling,
+		HeaderHandling:   headerHandling,
+		AuthCode:         authCode,
+		Validation:       validationBuild.String(),
+		ResponseModel:    respModel,
+		IsArray:          isArray,
+	})
+	return err
+}
+
+func detectResponseModel(op *openapi3.Operation) (string, bool) {
+	if op.Responses == nil {
+		return "", false
+	}
+	// Check for 200, 201, or default success
+	successCodes := []string{"200", "201", "202", "204", "default"}
+	for _, code := range successCodes {
+		respRef := op.Responses.Value(code)
+		if respRef == nil || respRef.Value == nil || respRef.Value.Content == nil {
+			continue
+		}
+		content := respRef.Value.Content.Get("application/json")
+		if content == nil || content.Schema == nil {
+			continue
+		}
+		schemaRef := content.Schema
+		if schemaRef.Ref != "" {
+			parts := strings.Split(schemaRef.Ref, "/")
+			return toGoName(parts[len(parts)-1]), false
+		}
+		// If it's an array of references
+		if schemaRef.Value != nil && schemaRef.Value.Type != nil && len(*schemaRef.Value.Type) > 0 && (*schemaRef.Value.Type)[0] == "array" {
+			if schemaRef.Value.Items != nil && schemaRef.Value.Items.Ref != "" {
+				parts := strings.Split(schemaRef.Value.Items.Ref, "/")
+				return toGoName(parts[len(parts)-1]), true
+			}
+		}
+	}
+	return "", false
+}
+
+type CmdConfig struct {
+	Method           string
+	GoName           string
+	CommandName      string
+	ModuleName       string
+	Path             string
+	OutputDir        string
+	Short            string
+	VarDecls         string
+	PathReplacements string
+	QueryBuild       string
+	HeaderBuild      string
+	CookieBuild      string
+	FlagsSetup       string
+	Imports          []string
+	BodyHandling     string
+	HeaderHandling   string
+	AuthCode         string
+	Validation       string
+	ResponseModel    string
+	IsArray          bool
+}
+
+func buildCmdCode(cfg CmdConfig) error {
+	var buf bytes.Buffer
+	if err := EndpointTmpl.Execute(&buf, cfg); err != nil {
+		return err
+	}
+
+	pathFile := filepath.Join(cfg.OutputDir, "cmd", strings.ToLower(cfg.GoName)+".go")
+	return os.WriteFile(pathFile, buf.Bytes(), 0644)
+}
+
+func buildPathParams(op openapi3.Operation, varDecls *strings.Builder, flagsSetup *strings.Builder, pathReplacements *strings.Builder, queryBuild *strings.Builder,
+	headerBuild *strings.Builder, cookieBuild *strings.Builder, validationBuild *strings.Builder, imports map[string]bool) {
 	for _, pRef := range op.Parameters {
 		if pRef == nil || pRef.Value == nil {
 			continue
@@ -55,12 +160,20 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		name := p.Name
 		in := p.In
 
-		// detect explode in arrayt
+		// detect explode in array
 		explode := false
 		if p.Style != "" {
 			if p.Style == "form" && p.Explode != nil {
 				explode = *p.Explode
 			}
+		}
+
+		separator := ","
+		switch p.Style {
+		case "pipeDelimited":
+			separator = "|"
+		case "spaceDelimited":
+			separator = " "
 		}
 
 		// init and default values to string
@@ -75,477 +188,145 @@ func writeEndpointCmd(outputDir string, moduleName string, cmdName string, op *o
 		// determine default value
 		defaultVal := defaultForType(goType)
 
-		if in == "path" {
+		switch in {
+		case "path":
 			varName += "Path"
 			varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
 			flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
-		} else if in == "query" {
+		case "query":
 			varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
 			flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
-		} else {
+		case "header":
+			varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
+			flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
+		case "cookie":
+			varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
+			flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s %s parameter\")\n", flagFunc, varName, name, defaultVal, in, name))
+		default:
 			continue
 		}
 
 		if pRef.Value.Required || p.In == "path" {
 			flagsSetup.WriteString(fmt.Sprintf("\tcmd.MarkFlagRequired(\"%s\")\n", name))
 		}
-
-		// code to handle where the param goes
-		if in == "path" {
+		if p.Schema != nil && p.Schema.Value != nil {
+			generateEnumCheck(validationBuild, varName, p.Schema.Value.Enum, imports)
+		}
+		switch in {
+		case "path":
 			// replace path placeholders with param values
 			replacement := varName
-			if goType == "int" {
+			switch goType {
+			case "int":
 				replacement = fmt.Sprintf("strconv.Itoa(%s)", varName)
-				needStrconv = true
-			} else if goType == "bool" {
+				imports["strconv"] = true
+			case "bool":
 				replacement = fmt.Sprintf("strconv.FormatBool(%s)", varName)
-				needStrconv = true
+				imports["strconv"] = true
 			}
 			pathReplacements.WriteString(fmt.Sprintf("\tpathWithParams = strings.ReplaceAll(pathWithParams, \"{%s}\", %s)\n", name, replacement))
-		} else if in == "query" {
+		case "query":
 			if goType == "string" {
 				queryBuild.WriteString(fmt.Sprintf("\tif %s != \"\" { q.Set(\"%s\", %s) }\n", varName, name, varName))
 			} else if goType == "int" {
 				replacement := fmt.Sprintf("strconv.Itoa(%s)", varName)
 				queryBuild.WriteString(fmt.Sprintf("\tif %s != 0 { q.Set(\"%s\", %s) }\n", varName, name, replacement))
-				needStrconv = true
+				imports["strconv"] = true
 			} else if goType == "bool" {
 				replacement := fmt.Sprintf("strconv.FormatBool(%s)", varName)
 				queryBuild.WriteString(fmt.Sprintf("\tq.Set(\"%s\", %s)\n", name, replacement))
-				needStrconv = true
+				imports["strconv"] = true
 			} else if strings.HasPrefix(goType, "[]") {
+				imports["fmt"] = true
 				if explode {
 					queryBuild.WriteString(fmt.Sprintf("\tfor _, v := range %s { q.Add(\"%s\", fmt.Sprintf(\"%%v\", v)) }\n", varName, name))
 				} else {
-					queryBuild.WriteString(fmt.Sprintf("\tif %s != nil { q.Set(\"%s\", strings.Join(func() []string { res := []string{}; for _, v := range %s { res = append(res, fmt.Sprintf(\"%%v\", v)) }; return res }(), \",\")) }\n", varName, name, varName))
+					queryBuild.WriteString(fmt.Sprintf("\tif %s != nil { q.Set(\"%s\", strings.Join(func() []string { res := []string{}; for _, v := range %s { res = append(res, fmt.Sprintf(\"%%v\", v)) }; return res }(), \"%s\")) }\n", varName, name, varName, separator))
 				}
 			}
-
-		} else if in == "header" {
-			queryBuild.WriteString(fmt.Sprintf("\t// header param %s available in %s variable\n", name, varName))
+		case "header":
+			switch goType {
+			case "string":
+				headerBuild.WriteString(fmt.Sprintf("\tif %s != \"\" { req.Header.Set(\"%s\", %s) }\n", varName, name, varName))
+			case "int":
+				replacement := fmt.Sprintf("strconv.Itoa(%s)", varName)
+				headerBuild.WriteString(fmt.Sprintf("\tif %s != 0 { req.Header.Set(\"%s\", %s) }\n", varName, name, replacement))
+				imports["strconv"] = true
+			case "bool":
+				replacement := fmt.Sprintf("strconv.FormatBool(%s)", varName)
+				headerBuild.WriteString(fmt.Sprintf("\treq.Header.Set(\"%s\", %s)\n", name, replacement))
+				imports["strconv"] = true
+			}
+		case "cookie":
+			switch goType {
+			case "string":
+				cookieBuild.WriteString(fmt.Sprintf("\tif %s != \"\" { req.AddCookie(&http.Cookie{Name: \"%s\", Value: %s}) }\n", varName, name, varName))
+			case "int":
+				replacement := fmt.Sprintf("strconv.Itoa(%s)", varName)
+				cookieBuild.WriteString(fmt.Sprintf("\tif %s != 0 { req.AddCookie(&http.Cookie{Name: \"%s\", Value: %s}) }\n", varName, name, replacement))
+				imports["strconv"] = true
+			case "bool":
+				replacement := fmt.Sprintf("strconv.FormatBool(%s)", varName)
+				cookieBuild.WriteString(fmt.Sprintf("\treq.AddCookie(&http.Cookie{Name: \"%s\", Value: %s})\n", name, replacement))
+				imports["strconv"] = true
+			}
 		}
 	}
-
-	// build import block
-	var importLines strings.Builder
-	for imp := range imports {
-		if imp == "strconv" && !needStrconv {
-			continue
-		}
-		importLines.WriteString(fmt.Sprintf("\t\"%s\"\n", imp))
-	}
-
-	// construct the final command source code
-	cmdCode := fmt.Sprintf(`package cmd
-
-import (
-%s
-)
-func New%sCmd() *cobra.Command {
-%s
-    cmd := &cobra.Command{
-        Use:   "%s",
-        Short: "%s",
-        RunE: func(cmd *cobra.Command, args []string) error {
-            cfg := config.Load("%s")
-            pathWithParams := "%s"
-%s
-            // build URL and query params
-            u := url.URL{Path: pathWithParams}
-            q := url.Values{}
-%s
-            u.RawQuery = q.Encode()
-            fullUrl := strings.TrimRight(cfg.BaseURL, "/") + u.String()
-%s
-            req, err := http.NewRequest("%s", fullUrl, bodyReader)
-            if err != nil {
-                return err
-            }
-%s
-			%s
-%s
-			
-
-            resp, err := http.DefaultClient.Do(req)
-            if err != nil {
-                return err
-            }
-            defer resp.Body.Close()
-            body, err := io.ReadAll(resp.Body)
-            if err != nil {
-                return err
-            }
-            var pretty interface{}
-
-			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				fmt.Println("Request failed:")
-				fmt.Printf("%%-15s: %%s\n", "Error", resp.Status)
-				fmt.Printf("%%-15s: %%s\n", "URL", resp.Request.URL.String())
-				fmt.Printf("%%-15s: %%s\n", "METHOD", resp.Request.Method)
-				fmt.Println("----------------")
-}
-			if strings.Contains(resp.Header.Get("Content-Type"), "json") {
-            if err := json.Unmarshal(body, &pretty); err != nil {
-                return err
-            }
-            prettyJSON, err := json.MarshalIndent(pretty, "", "  ")
-            if err != nil {
-                return err
-            }
-            fmt.Println("Response body:\n" + string(prettyJSON))
-			} else {
-			 	fmt.Println("Response body:\n" + string(body))
-			}
-            return nil
-        },
-    }
-%s
-    return cmd
-}
-`, importLines.String(), cmdName, varDecls.String(), cmdName, op.Summary, moduleName, path, pathReplacements.String(), queryBuild.String(), bodyHandling, strings.ToUpper(method), headerHandling, authCode, debugHandling, flagsSetup.String())
-
-	pathFile := filepath.Join(outputDir, "cmd", strings.ToLower(cmdName)+".go")
-	return os.WriteFile(pathFile, []byte(cmdCode), 0644)
 }
 
-func buildBodyHeaderHandling(method string, op *openapi3.Operation, imports map[string]bool, varDecls *strings.Builder, flagsSetup *strings.Builder,
-	schemaBodyBuild *strings.Builder, requiredChecks *strings.Builder) (string, string, string) {
-	var bodyHandling string
-	var headerHandling string
-	var debugHandling string
-	if strings.ToUpper(method) == "POST" || strings.ToUpper(method) == "PUT" || strings.ToUpper(method) == "PATCH" {
-		varDecls.WriteString("\tvar body string\n")
-		flagsSetup.WriteString("\tcmd.Flags().StringVarP(&body, \"body\", \"b\", \"\", \"Request body (raw JSON, @filename, or '-' for stdin)\")\n")
-		imports["bytes"] = true
-		imports["os"] = true
-		bodyHandling = fmt.Sprintf(`
-			// prepare request body (allow raw JSON, @filename, or '-' for stdin)
-			var bodyReader io.Reader
-			if body != "" {
-				if strings.HasPrefix(body, "@") {
-					fname := strings.TrimPrefix(body, "@")
-					var data []byte
-					var err error
-					if fname == "-" {
-						data, err = io.ReadAll(os.Stdin)
-						if err != nil {
-							return err
-						}
-					} else {
-						data, err = os.ReadFile(fname)
-						if err != nil {
-							return err
-						}
-					}
-					bodyReader = bytes.NewReader(data)
-				} else if body == "-" {
-					data, err := io.ReadAll(os.Stdin)
-					if err != nil {
-						return err
-					}
-					bodyReader = bytes.NewReader(data)
-				} else {
-					bodyReader = bytes.NewReader([]byte(body))
-				}
-			} else {
-			 %s
-			if body == "" {
-				%s
-				}	
-			}
-`, schemaBodyBuild, requiredChecks)
-		debugHandling = buildDebugHandling(method)
-
-		headerHandling = fmt.Sprintf(`
-			if bodyReader != nil {
-			    ct := contentType
-				if ct == "" {
-					ct = "%s"}
-				req.Header.Set("Content-Type", ct)
-			}
-`, chooseRequestContentType(op))
-		varDecls.WriteString("\tvar contentType string\n")
-		flagsSetup.WriteString("\tcmd.Flags().StringVar(&contentType, \"content-type\", \"\", \"Content-Type header for the request body\")\n")
-	} else if strings.ToUpper(method) == "GET" || strings.ToUpper(method) == "DELETE" {
-		// no body for GET/DELETE
-		imports["io"] = true
-		bodyHandling = `
-			var bodyReader io.Reader = nil
-`
-		debugHandling = buildDebugHandling(method)
-
-		headerHandling = ""
-	}
-	return bodyHandling, headerHandling, debugHandling
-}
-
-func buildDebugHandling(method string) string {
-	if strings.ToUpper(method) == "POST" || strings.ToUpper(method) == "PUT" || strings.ToUpper(method) == "PATCH" {
-		return `				
-			if Debug {
-				fmt.Println("---DEBUG INFO---")
-				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
-				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
-				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
-				if bodyReader != nil {
-					data, err := io.ReadAll(bodyReader)
-					if err != nil {
-						return err
-					}
-
-					var parsed interface{}
-					if json.Unmarshal(data, &parsed) == nil {
-						prettyDebugJSON, err := json.MarshalIndent(parsed, "", "  ")
-						if err != nil {
-							return err
-						}
-					fmt.Printf("Request Body:\n%s\n", prettyDebugJSON)
-					} else {
-						fmt.Printf("Request Body:\n%s\n", string(data))
-					}
-					bodyReader = bytes.NewReader(data) // reset bodyReader
-					
-					} else {
-						fmt.Printf("Request Body: (empty)\n")
-					}
-				fmt.Println("----------------")
-			}`
-	} else if strings.ToUpper(method) == "GET" || strings.ToUpper(method) == "DELETE" {
-		return `
-			if Debug {
-				fmt.Println("---DEBUG INFO---")
-				fmt.Printf("%-15s: %s\n", "Request Method", req.Method)
-				fmt.Printf("%-15s: %s\n", "URL", req.URL.String())
-				fmt.Printf("%-15s: %v\n", "Headers", req.Header)
-				fmt.Println("----------------")
-			}`
-	} else {
-		return ""
-	}
-}
-
-func defaultForType(goType string) string {
-	switch goType {
-	case "int":
-		return "0"
-	case "bool":
-		return "false"
-	case "[]int", "[]bool", "[]string":
-		return "nil"
-	default:
-		return "\"\""
-	}
-}
-
-func FlagVars(goType string, flagFunc string, p *openapi3.Parameter, imports map[string]bool) (string, string) {
-	if p.Schema != nil && p.Schema.Value != nil && p.Schema.Value.Type != nil {
-		switch (*p.Schema.Value.Type)[0] {
-		case "array":
-			if p.Schema.Value.Items != nil &&
-				p.Schema.Value.Items.Value != nil &&
-				p.Schema.Value.Items.Value.Type != nil &&
-				len(*p.Schema.Value.Items.Value.Type) > 0 {
-				switch (*p.Schema.Value.Items.Value.Type)[0] {
-				case "integer":
-					goType = "[]int"
-					flagFunc = "IntSliceVar"
-					imports["strconv"] = true
-				case "boolean":
-					goType = "[]bool"
-					flagFunc = "BoolSliceVar"
-					imports["strconv"] = true
-				default:
-					goType = "[]string"
-					flagFunc = "StringSliceVar"
+func findScheme(security *openapi3.SecurityRequirements, schemes map[string]AuthScheme, cookieBuild *strings.Builder,
+	queryBuild *strings.Builder) string {
+	var selectedScheme *AuthScheme
+	var authCode string
+	if security != nil {
+		found := false
+		for _, req := range *security {
+			for name := range req {
+				if s, ok := schemes[name]; ok {
+					selectedScheme = &s
+					found = true
+					break
 				}
 			}
-
-		case "string":
-			goType = "string"
-			flagFunc = "StringVar"
-		case "integer":
-			goType = "int"
-			flagFunc = "IntVar"
-			imports["strconv"] = true
-		case "boolean":
-			goType = "bool"
-			flagFunc = "BoolVar"
-			imports["strconv"] = true
-		default:
-			// treat other types as string for MVP
-			goType = "string"
-			flagFunc = "StringVar"
-		}
-	}
-	return goType, flagFunc
-}
-
-func mapSchemaToFlag(prop *openapi3.Schema) (string, string) {
-	// Default to string
-	goType := "string"
-	flagFunc := "StringVar"
-	if prop == nil || prop.Type == nil || len(*prop.Type) == 0 {
-		return goType, flagFunc
-	}
-	switch (*prop.Type)[0] {
-	case "array":
-		if prop.Items != nil &&
-			prop.Items.Value != nil &&
-			prop.Items.Value.Type != nil &&
-			len(*prop.Items.Value.Type) > 0 {
-
-			switch (*prop.Items.Value.Type)[0] {
-			case "integer":
-				goType = "[]int"
-				flagFunc = "IntSliceVar"
-			case "boolean":
-				goType = "[]bool"
-				flagFunc = "BoolSliceVar"
-			default:
-				goType = "[]string"
-				flagFunc = "StringSliceVar"
+			if found {
+				break
 			}
 		}
+	}
 
-	case "string":
-		goType = "string"
-		flagFunc = "StringVar"
-	case "integer":
-		goType = "int"
-		flagFunc = "IntVar"
-	case "boolean":
-		goType = "bool"
-		flagFunc = "BoolVar"
-	case "object":
-		goType = "map[string]interface{}"
-		flagFunc = "StringVar"
-	default:
-		// default to string for unknown types
-		goType = "string"
-		flagFunc = "StringVar"
-	}
-	return goType, flagFunc
-}
-
-func generateBodyFlagsFromSchema(op *openapi3.Operation, flagsSetup *strings.Builder, varDecls *strings.Builder,
-	SchemaBodyFlag *strings.Builder, requiredChecks *strings.Builder) {
-	if op.RequestBody == nil || op.RequestBody.Value == nil || op.RequestBody.Value.Content == nil {
-		return
-	}
-	content := op.RequestBody.Value.Content.Get("application/json")
-	if content == nil || content.Schema == nil || content.Schema.Value == nil {
-		return
-	}
-	schema := content.Schema.Value
-	if schema.Type != nil && len(*schema.Type) > 0 {
-		SchemaBodyFlag.WriteString(`bodyObj := map[string]interface{}{}
-		`)
-		switch (*schema.Type)[0] {
-		case "object":
-			path := []string{}
-			itterateProperties(schema, flagsSetup, varDecls, SchemaBodyFlag, path, requiredChecks)
+	if selectedScheme != nil {
+		// e.g. "PetstoreAuth"
+		fieldName := selectedScheme.Name
+		if len(fieldName) > 0 {
+			fieldName = strings.ToUpper(fieldName[:1]) + fieldName[1:]
 		}
-	}
-	SchemaBodyFlag.WriteString(`if body == "" && len(bodyObj) <= 0 {
-									return fmt.Errorf("request body is required (use either --body or body flags!!!)")
-								}
-								data, err := json.Marshal(bodyObj)
-								if err != nil {
-									return err
-								}
-								bodyReader = bytes.NewReader(data)
-								`)
-}
+		fieldName += "Auth"
 
-func buildRequestBodyFromSchemaFlags(schemaBodyBuild *strings.Builder, varName string, defaultVal string, path []string) []string {
-
-	schemaBodyBuild.WriteString(fmt.Sprintf(`
-	if %s != %s {
-	`, varName, defaultVal))
-	curr := "bodyObj"
-	for i := 0; i < len(path)-1; i++ {
-		key := path[i]
-		schemaBodyBuild.WriteString(fmt.Sprintf(`if _, ok := %s["%s"]; !ok {
-			%s["%s"] = map[string]interface{}{}
-	}
-		`, curr, key, curr, key))
-		curr = fmt.Sprintf(`%s["%s"].(map[string]interface{})`, curr, key)
-	}
-	schemaBodyBuild.WriteString(fmt.Sprintf(`
-		%s["%s"] = %s
+		if selectedScheme.Type == "http" && selectedScheme.Scheme == "bearer" {
+			authCode = fmt.Sprintf(`
+		if cfg.%s != "" {
+			req.Header.Set("Authorization", "Bearer "+cfg.%s)
 		}
-		`, curr, path[len(path)-1], varName))
-	return path
-}
-
-func isObjectSchema(s *openapi3.Schema) bool {
-	if s == nil || s.Type == nil {
-		return false
-	}
-	for _, t := range *s.Type {
-		if t == "object" {
-			return true
+		`, fieldName, fieldName)
+		} else if selectedScheme.Type == "apiKey" {
+			switch selectedScheme.In {
+			case "header":
+				authCode = fmt.Sprintf(`
+		if cfg.%s != "" {
+			req.Header.Set("%s", cfg.%s)}`, fieldName, selectedScheme.HeaderName, fieldName)
+			case "query":
+				queryBuild.WriteString(fmt.Sprintf(`
+		if cfg.%s != "" {
+			q.Set("%s", cfg.%s)
+		}`, fieldName, selectedScheme.HeaderName, fieldName))
+			case "cookie":
+				cookieBuild.WriteString(fmt.Sprintf(`
+		if cfg.%s != "" {
+			req.AddCookie(&http.Cookie{Name: "%s", Value: cfg.%s})
 		}
-	}
-	return false
-}
-
-func itterateProperties(schema *openapi3.Schema, flagsSetup *strings.Builder, varDecls *strings.Builder, SchemaBodyFlag *strings.Builder,
-	path []string, requiredChecks *strings.Builder) {
-	for propName, propRef := range schema.Properties {
-
-		childPath := append(path, propName)
-
-		if propRef != nil && propRef.Value != nil && propRef.Value.Type != nil && len(*propRef.Value.Type) > 0 {
-			if (*propRef.Value.Type)[0] == "object" {
-
-				itterateProperties(propRef.Value, flagsSetup, varDecls, SchemaBodyFlag, childPath, requiredChecks)
-				continue
+`, fieldName, selectedScheme.HeaderName, fieldName))
 			}
 		}
-
-		propSchema := propRef.Value
-		if propSchema == nil || propSchema.Type == nil {
-			continue
-		}
-
-		varName := sanitizeVar(strings.Join(childPath, "_"))
-
-		goType, flagFunc := mapSchemaToFlag(propSchema)
-
-		varDecls.WriteString(fmt.Sprintf("\tvar %s %s\n", varName, goType))
-
-		desc := propSchema.Description
-		if desc == "" {
-			desc = propName + " parameter"
-		}
-
-		if len(propSchema.Enum) > 0 {
-			desc += fmt.Sprintf(" (one of: %v)", propSchema.Enum)
-		}
-
-		flagName := strings.Join(childPath, "-")
-		flagsSetup.WriteString(fmt.Sprintf("\tcmd.Flags().%s(&%s, \"%s\", %s, \"%s\")\n",
-			flagFunc,
-			varName,
-			"body-"+flagName,
-			defaultForType(goType),
-			desc))
-		expr := buildRequestBodyFromSchemaFlags(SchemaBodyFlag, varName, defaultForType(goType), childPath)
-		generateRequiredCheck(schema, requiredChecks, expr)
 	}
-
-}
-
-func generateRequiredCheck(schema *openapi3.Schema, requiredChecks *strings.Builder, expr []string) {
-	curr := "bodyObj"
-	for i := 0; i < len(expr)-1; i++ {
-		key := expr[i]
-		curr = fmt.Sprintf(`%s["%s"].(map[string]interface{})`, curr, key)
-	}
-	readeablePath := strings.Join(expr, "-")
-	requiredChecks.WriteString(fmt.Sprintf(`if _, ok := %s["%s"]; !ok {
-			return fmt.Errorf("%s is required")
-		}
-		`, curr, expr[len(expr)-1], readeablePath))
+	return authCode
 }

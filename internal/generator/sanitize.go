@@ -28,19 +28,44 @@ func sanitizeVar(s string) string {
 	return out
 }
 
-func sanitizeCommandName(path, method string) string {
-	path = strings.Trim(path, "/")
-	path = strings.ReplaceAll(path, "/", "_")
-	path = strings.ReplaceAll(path, "{", "")
-	path = strings.ReplaceAll(path, "}", "")
-	parts := strings.Split(method+"_"+path, "_")
+func toGoName(s string) string {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
 	for i, p := range parts {
-		if p == "" {
-			continue
-		}
 		r := []rune(p)
 		r[0] = unicode.ToUpper(r[0])
 		parts[i] = string(r)
 	}
-	return strings.Join(parts, "_")
+	return strings.Join(parts, "")
+}
+
+func toCLIName(s string) string {
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
+	})
+	for i, p := range parts {
+		parts[i] = strings.ToLower(p)
+	}
+	return strings.Join(parts, "-")
+}
+
+func sanitizeCommandName(path, method string) string {
+	cleanPath := strings.ReplaceAll(path, "{", "")
+	cleanPath = strings.ReplaceAll(cleanPath, "}", "")
+	return toGoName(method + "_" + cleanPath)
+}
+
+func sanitizeCLIName(path, method string) string {
+	cleanPath := strings.ReplaceAll(path, "{", "")
+	cleanPath = strings.ReplaceAll(cleanPath, "}", "")
+	return toCLIName(method + "_" + cleanPath)
+}
+
+func sanitizeTagName(tag string) string {
+	return toGoName(tag)
+}
+
+func sanitizeTagCLIName(tag string) string {
+	return toCLIName(tag)
 }
